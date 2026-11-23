@@ -2,6 +2,7 @@
 # 口述史馆检索 API 演示脚本
 # 场景：首查 → 撤稿 → 续页（跳过被撤版本、补足当页）→ 同号重刊
 #      → 旧游标看不到重刊版 / 新检索能看到 → 撤稿不必等计分结束
+#      → 搭配核查：改词距不重建索引；撤掉不含关键词的稿会改变榜序
 # 用法：先启动服务（docker compose up --build 或本地 uvicorn），再执行 ./demo.sh
 set -euo pipefail
 
@@ -18,6 +19,14 @@ publish() { # doc_id tokens-json
 hr() { echo; echo "================================================================"; }
 
 echo "目标服务: $BASE"
+
+# 本脚本按固定稿号与版本号断言，需要空库：已有数据时先 docker compose down -v
+existing=$(curl -sS "$BASE/manuscripts" | jq '.manuscripts | length')
+if [ "$existing" != "0" ]; then
+  echo "✗ 库中已有 $existing 个稿件版本，演示需要在空库上运行。" >&2
+  echo "  请先清空数据（docker compose down -v）或换一个 DB_PATH 重启服务。" >&2
+  exit 1
+fi
 
 hr
 echo "1) 编辑刊发 7 篇分词后的转写稿（稿号 MS-001..MS-007）"
@@ -100,5 +109,62 @@ jq -c '[.hits[].doc_id]' /tmp/slow_search.json
 hr
 echo "10) 稿件版本终态"
 curl -sS "$BASE/manuscripts" | jq '[.manuscripts[]|{version,doc_id,status}]'
+
+hr
+echo "11) 搭配核查：撤掉一篇不含关键词的在刊稿，榜序随之改变"
+echo "   先用一组新稿做搭配演示（关键词：矿井）"
+publish CO-001 '["矿井","巷道","工牌","老周"]'      | jq -c '{doc_id,version}'
+publish CO-002 '["早班","矿井","巷道","灯房"]'      | jq -c '{doc_id,version}'
+publish CO-003 '["矿井","风机","巷道","煤车"]'      | jq -c '{doc_id,version}'
+publish CO-004 '["班长","矿井","风机","煤车"]'      | jq -c '{doc_id,version}'
+publish CO-005 '["巷道","风机","井口"]'             | jq -c '{doc_id,version}'
+publish CO-006 '["巷道","学徒","夜校"]'             | jq -c '{doc_id,version}'
+echo "--- 词距 2 的搭配榜（只列分数/同现稿数/最近出处）---"
+colloc() { post /collocations "$1"; }
+before=$(colloc '{"term":"矿井","max_distance":2,"limit":20}')
+echo "$before" | jq '{published_manuscripts, keyword_doc_count,
+  results:[.results[]|{collocate,score,cooccurring_docs,evidence}]}'
+echo "--- 换成词距 1：无需重建索引，同现稿数立即变化 ---"
+colloc '{"term":"矿井","max_distance":1,"limit":20}' \
+  | jq '{max_distance, results:[.results[]|{collocate,cooccurring_docs}]}'
+
+echo "--- 撤掉 CO-006（不含关键词“矿井”，只改变总稿数与“巷道”的在刊稿数）---"
+post /manuscripts/CO-006/withdraw '' | jq -c .
+after=$(colloc '{"term":"矿井","max_distance":2,"limit":20}')
+echo "$after" | jq '{published_manuscripts, keyword_doc_count,
+  results:[.results[]|{collocate,score,cooccurring_docs,evidence}]}'
+if [ "$(echo "$before" | jq -r '[.results[].collocate]|join(",")')" = "风机,巷道" ] \
+   && [ "$(echo "$after" | jq -r '[.results[].collocate]|join(",")')" = "巷道,风机" ]; then
+  b_fan=$(echo "$before" | jq -r '.results[]|select(.collocate=="风机").score')
+  b_alley=$(echo "$before" | jq -r '.results[]|select(.collocate=="巷道").score')
+  a_fan=$(echo "$after" | jq -r '.results[]|select(.collocate=="风机").score')
+  a_alley=$(echo "$after" | jq -r '.results[]|select(.collocate=="巷道").score')
+  echo "✓ 撤掉不含关键词的 CO-006 后榜序改变："
+  echo "  撤前 风机 $b_fan > 巷道 $b_alley ；撤后 巷道 $a_alley > 风机 $a_fan"
+  echo "  （同现稿数不变，总稿数与“巷道”在刊稿数变化使分数重排）"
+else
+  echo "✗ 搭配榜序未按预期变化"; exit 1
+fi
+
+hr
+echo "12) 核查期间可刊撤：慢速核查读的是同一份已提交语料"
+echo "   后台发起延迟 3 秒的核查，期间撤掉不含关键词的 CO-005"
+post /collocations '{"term":"矿井","max_distance":2,"limit":20,"debug_delay_seconds":3}' \
+  > /tmp/slow_colloc.json &
+slow_pid=$!
+sleep 0.5
+t0=$(date +%s%3N)
+curl -sS -X POST "$BASE/manuscripts/CO-005/withdraw" | jq -c .
+t1=$(date +%s%3N)
+echo "   撤稿耗时 $((t1 - t0)) ms（远小于核查的 3000 ms，未被阻塞）"
+wait $slow_pid
+snapshot_n=$(jq -r .published_manuscripts /tmp/slow_colloc.json)
+echo "   慢核查仍按撤稿前的快照返回（published_manuscripts=$snapshot_n，撤稿前语料）："
+jq -c '{published_manuscripts, results:[.results[]|{collocate,cooccurring_docs}]}' \
+  /tmp/slow_colloc.json
+
+hr
+echo "13) 索引导航校验（升级/撤稿后统计与在刊稿一致）"
+curl -sS "$BASE/collocations/upgrade-check" | jq -c .
 echo
 echo "演示完成。"
